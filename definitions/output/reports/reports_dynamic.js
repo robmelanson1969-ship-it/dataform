@@ -24,14 +24,14 @@ const EXPORT_CONFIG = {
   bucket: constants.bucket,
   storagePath: constants.storagePath,
   dataset: 'reports',
-  testSuffix: '.json'
+  fileFormat: '.json'
 }
 
 // Date range for report generation
 // Adjust these dates to update reports retrospectively
 const DATE_RANGE = {
-  startDate: constants.currentMonth, // '2025-07-01'
-  endDate: constants.currentMonth    // '2025-07-01'
+  startDate: constants.currentMonth,
+  endDate: constants.currentMonth
 }
 
 /**
@@ -40,21 +40,22 @@ const DATE_RANGE = {
  * @returns {string} - Cloud Storage object path
  */
 function buildExportPath(reportConfig) {
-  const { sql, date, metric } = reportConfig
+  const { sql, date, metric, lens } = reportConfig
+  const lensPath = lens && lens.name && lens.name !== 'all' ? `${lens.name}/` : ''
   let objectPath = EXPORT_CONFIG.storagePath
 
   if (sql.type === 'histogram') {
-    // Histogram exports are organized by date folders
+    // Histogram exports are organized under date and lens folders
     const dateFolder = date.replaceAll('-', '_')
-    objectPath += `${dateFolder}/${metric.id}`
+    objectPath += `${dateFolder}/${lensPath}${metric.id}${EXPORT_CONFIG.fileFormat}`
   } else if (sql.type === 'timeseries') {
-    // Timeseries exports are organized by metric
-    objectPath += metric.id
+    // Timeseries exports are organized under lens folders
+    objectPath += `${lensPath}${metric.id}${EXPORT_CONFIG.fileFormat}`
   } else {
     throw new Error(`Unknown SQL type: ${sql.type}`)
   }
 
-  return objectPath + EXPORT_CONFIG.testSuffix
+  return objectPath
 }
 
 /**
@@ -74,17 +75,19 @@ function buildExportQuery(reportConfig) {
       WHERE date = '${date}'
         AND metric = '${metric.id}'
         AND lens = '${lens.name}'
-      ORDER BY bin ASC
+      ORDER BY client, bin ASC
     `
   } else if (sql.type === 'timeseries') {
     query = `
       SELECT
+        CAST(UNIX_DATE(date) * 1000 * 60 * 60 * 24 AS STRING) AS timestamp,
         FORMAT_DATE('%Y_%m_%d', date) AS date,
         * EXCEPT(date, metric, lens)
       FROM \`${EXPORT_CONFIG.dataset}.${tableName}\`
-      WHERE metric = '${metric.id}'
+      WHERE
+        metric = '${metric.id}'
         AND lens = '${lens.name}'
-      ORDER BY date DESC
+      ORDER BY date, client DESC
     `
   } else {
     throw new Error(`Unknown SQL type: ${sql.type}`)
@@ -104,13 +107,20 @@ function buildExportQuery(reportConfig) {
  * @returns {Object} - Complete report configuration
  */
 function createReportConfig(date, metric, sql, lensName, lensSQL) {
+  let tableName
+  if (sql.type === 'timeseries' || sql.type === 'histogram') {
+    tableName = `${metric.id}_${sql.type}`
+  } else {
+    throw new Error(`Unknown SQL type: ${sql.type}`)
+  }
+
   return {
     date,
     metric,
     sql,
     lens: { name: lensName, sql: lensSQL },
     devRankFilter: constants.devRankFilter,
-    tableName: `${metric.id}_${sql.type}`
+    tableName: tableName
   }
 }
 
@@ -126,8 +136,10 @@ function generateReportConfigurations() {
     date >= DATE_RANGE.startDate;
     date = constants.fnPastMonth(date)) {
 
+    const whitelistedMetrics = availableMetrics.filter(metric => metric.enabled) // TODO: reports are whitelisted during migration
+
     // For each available metric
-    availableMetrics.forEach(metric => {
+    whitelistedMetrics.forEach(metric => {
       // For each SQL type (histogram, timeseries)
       metric.SQL.forEach(sql => {
         // For each available lens (all, top1k, wordpress, etc.)
@@ -148,8 +160,10 @@ function generateReportConfigurations() {
  * @returns {string} - Operation name
  */
 function createOperationName(reportConfig) {
-  const { tableName, date, lens } = reportConfig
-  return `${tableName}_${date}_${lens.name}`
+  const { sql, date, lens, metric } = reportConfig
+  const lensSuffix = lens && lens.name ? `_${lens.name}` : ''
+
+  return `${metric.id}_${sql.type}_${date}${lensSuffix}`
 }
 
 /**
@@ -164,28 +178,40 @@ function generateOperationSQL(ctx, reportConfig) {
   return `
 DECLARE job_config JSON;
 
-/* First report run - uncomment to create table
+-- Run analysis once
+CREATE TEMP TABLE ${tableName}_temp AS (
+  ${sql.query(ctx, reportConfig)}
+);
+
+-- Create table on first run (schema only, no data)
 CREATE TABLE IF NOT EXISTS ${EXPORT_CONFIG.dataset}.${tableName}
 PARTITION BY date
 CLUSTER BY metric, lens, client
 AS
-*/
+SELECT
+  client,
+  DATE('${date}') AS date,
+  '${metric.id}' AS metric,
+  '${lens.name}' AS lens,
+  * EXCEPT(client)
+FROM ${tableName}_temp
+WHERE FALSE;
 
---/* Subsequent report run
+-- Delete existing data for this partition
 DELETE FROM ${EXPORT_CONFIG.dataset}.${tableName}
 WHERE date = '${date}'
   AND metric = '${metric.id}'
   AND lens = '${lens.name}';
-INSERT INTO ${EXPORT_CONFIG.dataset}.${tableName}
---*/
 
+-- Insert fresh data
+INSERT INTO ${EXPORT_CONFIG.dataset}.${tableName}
 SELECT
+  client,
+  DATE('${date}') AS date,
   '${metric.id}' AS metric,
   '${lens.name}' AS lens,
-  *
-FROM (
-  ${sql.query(ctx, reportConfig)}
-);
+  * EXCEPT(client)
+FROM ${tableName}_temp;
 
 SET job_config = TO_JSON(
   STRUCT(
@@ -209,9 +235,7 @@ const reportConfigurations = generateReportConfigurations()
 reportConfigurations.forEach(reportConfig => {
   const operationName = createOperationName(reportConfig)
 
-  operate(operationName, {
-    disabled: true,
-  })
-    .tags(['crawl_complete', 'crawl_reports'])
+  operate(operationName)
+    .tags(['crawl_complete'])
     .queries(ctx => generateOperationSQL(ctx, reportConfig))
 })
